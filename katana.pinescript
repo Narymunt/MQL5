@@ -1,0 +1,98 @@
+//@version=6
+strategy("SHODAN9 Katana", overlay=true, pyramiding=0,process_orders_on_close=true)
+
+// --- parametry SAR (do podglądu na wykresie)
+start = input.float(0.02, "SAR start")
+increment = input.float(0.24, "SAR increment")
+maximum = input.float(0.24,  "SAR max")
+
+// --- Parabolic SAR (dla wizualizacji)
+var bool  uptrend    = false
+var float EP         = na
+var float SAR        = na
+var float AF         = start
+var float nextBarSAR = na
+
+if bar_index > 0
+    firstTrendBar = false
+    SAR := nextBarSAR
+    if bar_index == 1
+        float prevSAR = na
+        float prevEP  = na
+        lowPrev  = low[1]
+        highPrev = high[1]
+        closeCur = close
+        closePrev = close[1]
+        if closeCur > closePrev
+            uptrend := true
+            EP := high
+            prevSAR := lowPrev
+            prevEP := high
+        else
+            uptrend := false
+            EP := low
+            prevSAR := highPrev
+            prevEP := low
+        firstTrendBar := true
+        SAR := prevSAR + start * (prevEP - prevSAR)
+    if uptrend
+        if SAR > low
+            firstTrendBar := true
+            uptrend := false
+            SAR := math.max(EP, high)
+            EP := low
+            AF := start
+    else
+        if SAR < high
+            firstTrendBar := true
+            uptrend := true
+            SAR := math.min(EP, low)
+            EP := high
+            AF := start
+    if not firstTrendBar
+        if uptrend
+            if high > EP
+                EP := high
+                AF := math.min(AF + increment, maximum)
+        else
+            if low < EP
+                EP := low
+                AF := math.min(AF + increment, maximum)
+    if uptrend
+        SAR := math.min(SAR, low[1])
+        if bar_index > 1
+            SAR := math.min(SAR, low[2])
+    else
+        SAR := math.max(SAR, high[1])
+        if bar_index > 1
+            SAR := math.max(SAR, high[2])
+    nextBarSAR := SAR + AF * (EP - SAR)
+
+// --- Heiken-Ashi z regularnych świec
+haSym = ticker.heikinashi(syminfo.tickerid)
+[haO, haH, haL, haC] = request.security(haSym, timeframe.period, [open, high, low, close])
+
+haBull = haC >= haO
+haBear = haC <  haO
+firstGreen = haBull and not haBull[1]   // pierwsza zielona po czerwonych
+firstRed   = haBear and not haBear[1]   // pierwsza czerwona po zielonych
+
+// --- Wejścia/wyjścia
+if barstate.isconfirmed
+    if firstGreen
+        // zamknij short, jeśli otwarty
+        if strategy.position_size < 0
+            strategy.cancel("Short")
+        // otwórz long
+        strategy.entry("Long", strategy.long)
+    if firstRed
+        // zamknij long, jeśli otwarty
+        if strategy.position_size > 0
+            strategy.cancel("Long")
+        // otwórz short
+        strategy.entry("Short", strategy.short)
+
+
+// --- Rysowanie SAR
+plot(SAR,        "SAR",          style=plot.style_cross, linewidth=3, color=color.orange)
+plot(nextBarSAR, "Next bar SAR", style=plot.style_cross, linewidth=3, color=color.aqua)
