@@ -6,7 +6,7 @@
 //+------------------------------------------------------------------+
 #property copyright "Copyright 2025, MetaQuotes Ltd."
 #property link      "https://www.mql5.com"
-#property version   "1.10"
+#property version   "1.12"
 
 #include <Trade\Trade.mqh>
 
@@ -19,7 +19,7 @@ input double LotSize      = 0.01;      // Wielkość pozycji
 input double SarStep      = 0.05;      // SAR step
 input double SarMaximum   = 0.30;      // SAR maximum
 input ulong  MagicNumber  = 909001;    // Magic number EA
-input int    DeviationPts = 20;        // Maksymalne odchylenie ceny w punktach
+input int    DeviationPts = 20;        // Maksymalny poślizg ceny w punktach
 
 //+------------------------------------------------------------------+
 //| Uchwyty indikatorów                                              |
@@ -28,7 +28,7 @@ int handleAO  = INVALID_HANDLE;
 int handleSAR = INVALID_HANDLE;
 
 //+------------------------------------------------------------------+
-//| Kontrola pracy tylko raz na nowej świecy                         |
+//| Kontrola pracy logiki wejścia tylko raz na nowej świecy          |
 //+------------------------------------------------------------------+
 datetime lastBarTime = 0;
 
@@ -125,11 +125,9 @@ void OpenLong()
 {
    int currentType = GetCurrentPositionType();
 
-   // Jeżeli już jest BUY, nic nie robimy.
    if(currentType == POSITION_TYPE_BUY)
       return;
 
-   // Jeżeli jest SELL albo inne pozycje EA, zamykamy wszystko.
    if(!CloseAllPositionsForSymbol())
    {
       Print("Nie udało się zamknąć wszystkich pozycji przed otwarciem BUY.");
@@ -153,11 +151,9 @@ void OpenShort()
 {
    int currentType = GetCurrentPositionType();
 
-   // Jeżeli już jest SELL, nic nie robimy.
    if(currentType == POSITION_TYPE_SELL)
       return;
 
-   // Jeżeli jest BUY albo inne pozycje EA, zamykamy wszystko.
    if(!CloseAllPositionsForSymbol())
    {
       Print("Nie udało się zamknąć wszystkich pozycji przed otwarciem SELL.");
@@ -175,15 +171,69 @@ void OpenShort()
 }
 
 //+------------------------------------------------------------------+
+//| Tickowe zamknięcie pozycji po aktualnym SAR[0]                   |
+//+------------------------------------------------------------------+
+bool CheckCurrentSarExit()
+{
+   int currentType = GetCurrentPositionType();
+
+   if(currentType != POSITION_TYPE_BUY && currentType != POSITION_TYPE_SELL)
+      return false;
+
+   double sarNow[];
+
+   ArrayResize(sarNow, 1);
+
+   if(CopyBuffer(handleSAR, 0, 0, 1, sarNow) <= 0)
+   {
+      Print("Nie można odczytać aktualnego SAR[0]!");
+      return false;
+   }
+
+   MqlTick tick;
+
+   if(!SymbolInfoTick(_Symbol, tick))
+   {
+      Print("Nie można odczytać aktualnego ticka!");
+      return false;
+   }
+
+   double SAR_0 = sarNow[0];
+
+   // Dla LONG zamykamy pozycję, gdy aktualny SAR pojawił się nad bieżącą ceną.
+   // Zamknięcie LONG odbywa się po BID, więc porównujemy z tick.bid.
+   bool closeLongByCurrentSar =
+      currentType == POSITION_TYPE_BUY &&
+      SAR_0 > tick.bid;
+
+   // Dla SHORT zamykamy pozycję, gdy aktualny SAR pojawił się pod bieżącą ceną.
+   // Zamknięcie SHORT odbywa się po ASK, więc porównujemy z tick.ask.
+   bool closeShortByCurrentSar =
+      currentType == POSITION_TYPE_SELL &&
+      SAR_0 < tick.ask;
+
+   if(closeLongByCurrentSar)
+   {
+      PrintFormat("TICK EXIT LONG: SAR[0]=%.5f > BID=%.5f", SAR_0, tick.bid);
+      CloseAllPositionsForSymbol();
+      return true;
+   }
+
+   if(closeShortByCurrentSar)
+   {
+      PrintFormat("TICK EXIT SHORT: SAR[0]=%.5f < ASK=%.5f", SAR_0, tick.ask);
+      CloseAllPositionsForSymbol();
+      return true;
+   }
+
+   return false;
+}
+
+//+------------------------------------------------------------------+
 //| Expert initialization function                                   |
 //+------------------------------------------------------------------+
 int OnInit()
 {
-   PrintFormat("TERMINAL_TRADE_ALLOWED=%d MQL_TRADE_ALLOWED=%d ACCOUNT_TRADE_ALLOWED=%d",
-            TerminalInfoInteger(TERMINAL_TRADE_ALLOWED),
-            MQLInfoInteger(MQL_TRADE_ALLOWED),
-            AccountInfoInteger(ACCOUNT_TRADE_ALLOWED));
-
    trade.SetExpertMagicNumber(MagicNumber);
    trade.SetDeviationInPoints(DeviationPts);
 
@@ -225,12 +275,18 @@ void OnDeinit(const int reason)
 //+------------------------------------------------------------------+
 void OnTick()
 {
-   // Pracujemy tylko raz po pojawieniu się nowej świecy.
-   // Dzięki temu świeca [1] jest już zamknięta.
+   // Priorytet 1:
+   // Zamknięcie po aktualnym SAR[0] działa CO TICK.
+   // Nie czekamy na zamknięcie świecy.
+   if(CheckCurrentSarExit())
+      return;
+
+   // Priorytet 2:
+   // Wejścia / odwrócenia pozycji robimy tylko raz na nowej świecy,
+   // ponieważ AO[1] i AO[2] muszą pochodzić z zamkniętych świec.
    if(!IsNewBar())
       return;
 
-   // Dynamiczne tablice są konieczne, żeby ArraySetAsSeries działało bez warningów.
    double ao[];
    double sar[];
    double high[];
@@ -272,13 +328,12 @@ void OnTick()
 
    // Indeksy po ArraySetAsSeries(..., true):
    //
-   // ao[0]  - aktualna świeca, jeszcze niezakończona
-   // ao[1]  - poprzednia zamknięta świeca
-   // ao[2]  - świeca wcześniejsza
+   // ao[0]   - aktualna świeca, jeszcze niezakończona
+   // ao[1]   - poprzednia zamknięta świeca
+   // ao[2]   - świeca wcześniejsza
    //
-   // sar[1] - SAR dla poprzedniej zamkniętej świecy
-   // low[1] - minimum poprzedniej zamkniętej świecy
-   // high[1]- maksimum poprzedniej zamkniętej świecy
+   // sar[0]  - aktualny SAR na bieżącej świecy
+   // sar[1]  - SAR poprzedniej zamkniętej świecy
 
    double AO_1  = ao[1];
    double AO_2  = ao[2];
@@ -287,23 +342,16 @@ void OnTick()
    double High_1 = high[1];
    double Low_1  = low[1];
 
-   bool sarBelowCandle = SAR_1 < Low_1;
-   bool sarAboveCandle = SAR_1 > High_1;
+   bool sarBelowClosedCandle = SAR_1 < Low_1;
+   bool sarAboveClosedCandle = SAR_1 > High_1;
 
    bool aoGrowing = AO_1 > AO_2;
    bool aoFalling = AO_1 < AO_2;
 
-   // Sygnał LONG:
-   // poprzednia świeca zamknięta z SAR pod świecą
-   // oraz AO[1] > AO[2]
-   bool longSignal = sarBelowCandle && aoGrowing;
+   bool longSignal  = sarBelowClosedCandle && aoGrowing;
+   bool shortSignal = sarAboveClosedCandle && aoFalling;
 
-   // Sygnał SHORT:
-   // poprzednia świeca zamknięta z SAR nad świecą
-   // oraz AO[1] < AO[2]
-   bool shortSignal = sarAboveCandle && aoFalling;
-
-   PrintFormat("AO[1]=%.5f AO[2]=%.5f SAR[1]=%.5f Low[1]=%.5f High[1]=%.5f long=%d short=%d",
+   PrintFormat("ENTRY CHECK: AO[1]=%.5f AO[2]=%.5f SAR[1]=%.5f Low[1]=%.5f High[1]=%.5f long=%d short=%d",
                AO_1,
                AO_2,
                SAR_1,
@@ -315,10 +363,13 @@ void OnTick()
    if(longSignal)
    {
       OpenLong();
+      return;
    }
-   else if(shortSignal)
+
+   if(shortSignal)
    {
       OpenShort();
+      return;
    }
 }
 //+------------------------------------------------------------------+
